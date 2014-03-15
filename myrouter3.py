@@ -47,6 +47,7 @@ class Router(object):
 		self.forwarding_table = my_intfs + fwd 
 		self.queue = [] #a list of tuples for storing ARP requested packets
 		self.macaddrs = {} #cache of {IP:addr} mappings to cut down ARP requests
+		
 	def router_main(self):    
 		while True:
 			self.check_queue_times()
@@ -56,43 +57,33 @@ class Router(object):
 				# log_debug("Timeout waiting for packets")
 				continue
 			except SrpyShutdown:
-				return   
+				return  
 			#part 2: forwarding packets and making ARP_request to obtain MAC address
 			if pkt.type == pkt.IP_TYPE:
 				pkt = pkt.payload
-				destIP = pkt.dstip
-				if destIP in self.my_intfs: #part 3: ICMP shtuffs.
-				    if pkt.protocol == pktlib.ICMP_PROTOCOL and pkt.payload.type == pktlib.TYPE_ECHO_REQUEST: #if it's a ping
-				        self.make_ICMP('PING', pkt)
-				    else: #if destined for us, but not an echo
-				        self.make_ICMP('UNREACH_PORT', pkt)
-				matches = []
-				cidrlen = 0
-				for i in self.forwarding_table:
-					netmask = i[1]
-					length = netmask_to_cidr(netmask)
-					forwardIP = i[0]
-					nexthop = i[2] if i[2] != IPAddr('0.0.0.0') else destIP
-					ifname = i[3]
-					if((forwardIP.toUnsigned() & netmask.toUnsigned()) == (destIP.toUnsigned() & netmask.toUnsigned())):
-						matches.append((length, destIP, nexthop, ifname))  #length, net_prefix, next hop, eth#
-				if len(matches)!=0: #if we have at least one match 
-					#finding MAC address -> SENDING ARP_REQUEST
-					low = 0
-					match = ()
-					for i in matches:
-						if(i[0]>low):
-							match = i
-							low = i[0]
-					if match[2] in [str(x[2]) for x in self.my_intfs]: #packet for us, drop it on the floor
+				match = None
+				match = self.FT_lookup(pkt, dev)
+				if match==None:
+					self.make_ICMP('UNREACH_NET',pkt, dev)
+					continue
+				else:
+					if match[2] in [str(x[2]) for x in self.my_intfs]: #packet for us, send unreachable port error
+						if pkt.protocol == pkt.ICMP_PROTOCOL and pkt.payload.type == pktlib.TYPE_ECHO_REQUEST: #if it's a ping
+							print 'making ICMP for PING'
+							self.make_ICMP('PING', pkt, dev)
+							continue
+						else: #if destined for us, but not an echo
+							self.make_ICMP('UNREACH_PORT', pkt, dev)
+							continue
+					pkt.ttl -= 1;
+					if pkt.ttl==0:
+						self.make_ICMP('TIMEEXCEED', pkt, dev)
 						continue;
 					if match[2] not in self.macaddrs:
 						self.queue.append([match, floor(time()), pkt, 0])
 						self.send_arp_request(match)
 					else:
-					    self.send_packet(match, pkt)
-                else:
-                    self.make_ICMP('UNREACH_NET', pkt)		
+						self.send_packet(match, pkt)   
 			#part 1: responding to ARP request
 			elif pkt.type == pkt.ARP_TYPE:
 				arp = pkt.payload
@@ -103,7 +94,7 @@ class Router(object):
 						if(arp.protosrc == nexthop): #we found our guy    ------------changed nexthop to pktdst
 							self.macaddrs[nexthop] = arp.hwsrc
 							self.queue.remove(elem)
-							self.send_packet(elem[0],ippkt)	
+							self.send_packet(elem[0],ippkt) 
 				else:
 					for intf in self.net.interfaces(): #if request from someone else/ need reply
 						if (intf.ipaddr==arp.protodst):
@@ -122,8 +113,38 @@ class Router(object):
 							self.net.send_packet(dev, ether)
 							#self.net.send_packet(dev, arp_reply)
 							break
+	
+	def print_ft(self):
+		for i in self.forwarding_table:
+			print i
+			print '\n'
+	
+	def FT_lookup(self, pkt, dev):
+		destIP = pkt.dstip                  
+		matches = []
+		cidrlen = 0
+		matches = []
+		for i in self.forwarding_table:
+			netmask = i[1]
+			length = netmask_to_cidr(netmask)
+			forwardIP = i[0]
+			nexthop = i[2] if i[2] != IPAddr('0.0.0.0') else destIP
+			ifname = i[3]
+			if((forwardIP.toUnsigned() & netmask.toUnsigned()) == (destIP.toUnsigned() & netmask.toUnsigned())):
+				matches.append((length, destIP, nexthop, ifname, dev))  #length, net_prefix, next hop, eth#
+		match = None
+		if len(matches)!=0: #if we have at least one match 
+			#finding MAC address -> SENDING ARP_REQUEST
+			low = 0
+			for i in matches:
+				if(i[0]>low):
+					match = i
+					low = i[0]
+		return match
 
-	#tup = (prefixlength, destIP, nexthop, ifname)
+	#tup = (prefixlength, destIP, nexthop, ifname, dev)
+	#where dev is the device the packet arrived on, and 
+	#ifname is the name of the device it should be sent out on
 	def send_arp_request(self, tup):
 		preflen = tup[0]
 		destIP = tup[1]
@@ -149,18 +170,20 @@ class Router(object):
 
 
 	#tup is a FT match tuple, like above
-	#tup = (prefixlength, destIP, nexthop, ifname)
+	#tup = (prefixlength, destIP, nexthop, ifname, dev)
 	def send_packet(self, tup, pkt):
 		preflen = tup[0]
 		destIP = tup[1]
 		nexthop = tup[2]
 		ifname = tup[3]
+		dev = tup[4] #the incoming device, needed if we have to make ICMP for pkt
 		intf = self.net.interface_by_name(ifname)
-		
+		'''
 		pkt.ttl = pkt.ttl-1
 		if(pkt.ttl==0):
-		    make_ICMP('TIMEEXCEED', pkt)
-		    break
+			make_ICMP('TIMEEXCEED', pkt, dev)
+			return
+		'''
 		ether = pktlib.ethernet()
 		ether.type = ether.IP_TYPE
 		ether.src = intf.ethaddr
@@ -176,53 +199,66 @@ class Router(object):
 			index = self.queue.index(elem)
 			if arpcount==4:
 				self.queue.remove(elem)
-				self.make_ICMP('UNREACH_HOST', elem[2])
+				self.make_ICMP('UNREACH_HOST', elem[2], elem[0][4])
 				continue
-				#timeout :(
 			if timenow-time_added>=1: # if one or more seconds has elapsed since last sending an ARP request
 				self.send_arp_request(elem[0])
 				self.queue[index][1] = timenow
 				self.queue[index][3] = arpcount+1
 				
-	def make_ICMP(self, TYPE, pkt):
-	    icmppkt = pktlib.icmp()  
-	    if(TYPE=='PING'): #if ping type
-	        icmppkt.type = pktlib.TYPE_ECHO_REPLY
-	        ping = pktlib.echo()
-	        ping.id = pkt.payload.id
-	        ping.seq = pkt.payload.seq
-	        ping.payload = pkt.payload.payload
-	        icmppkt.payload = ping
-	    else: #if error message
-	        if(TYPE=='TIMEEXCEED'):
-	            icmppkt.type = pktlib.TYPE_TIME_EXCEED
-	        else:
-	            icmppkt.type = pktlib.TYPE_DEST_UNREACH
-	            if(TYPE=='UNREACH_NET'): #if table lookup failed
-	                icmppkt.code = pktlib.CODE_UNREACH_NET
-	            elif(TYPE=='UNREACH_HOST'): #if sent 5 arps and no reply from host
-	                icmppkt.code = pktlib.CODE_UNREACHHOST
-	            elif(TYPE=='UNREACH_PORT'): #sent to us, but not an ICMP PING
-	                icmppkt.code = pktlib.CODE_UNREACH_PORT
-	            else:
-	                print 'wtf?  if it wasnt one of these erros, something REALLY went wrong'
-            icmppkt.payload = pktlib.unreach()
-            icmppkt.payload.payload = pkt.dump()[:28]
-	    #wrap up in IP then ethernet 
-	    ipreply = pkt.ipv4()
-	    ipreply.srcip = #need address of router's interface that recieved pkt
-	    ipreply.dstip = pkt.srcip()
-	    ipreply.ttl = 64
-	    ipreply.payload = icmppkt
-	    
-	    ether = pktlib.ethernet()
+	#TYPE = the string code for what type of IC message we are creating
+	#pkt = the IP packet that triggered the message
+	def make_ICMP(self, TYPE, pkt, dev):
+		icmppkt = pktlib.icmp()  
+		if(TYPE=='PING'): #if ping type
+			icmppkt.type = pktlib.TYPE_ECHO_REPLY
+			ping = pktlib.echo()
+			ping.id = pkt.payload.payload.id
+			ping.seq = pkt.payload.payload.seq
+			ping.payload = pkt.payload.payload.payload #It's like christmas, so much unwrapping
+			icmppkt.payload = ping
+		else: #if error message
+			if(TYPE=='TIMEEXCEED'):
+				icmppkt.type = pktlib.TYPE_TIME_EXCEED
+			else:
+				icmppkt.type = pktlib.TYPE_DEST_UNREACH
+				if(TYPE=='UNREACH_NET'): #if table lookup failed
+					icmppkt.code = pktlib.CODE_UNREACH_NET
+				elif(TYPE=='UNREACH_HOST'): #if sent 5 arps and no reply from host
+					icmppkt.code = pktlib.CODE_UNREACH_HOST
+				elif(TYPE=='UNREACH_PORT'): #sent to us, but not an ICMP PING
+					icmppkt.code = pktlib.CODE_UNREACH_PORT
+				else:
+					print 'wtf?  if it wasnt one of these errors, something REALLY went wrong'
+			icmppkt.payload = pktlib.unreach()
+			icmppkt.payload.payload = pkt.dump()[:28]
+		
+		#wrap up in IP then ethernet
+		ipreply = pktlib.ipv4()
+		ipreply.protocol = ipreply.ICMP_PROTOCOL
+		ipreply.dstip = pkt.srcip
+		ipreply.ttl = 65 #make this bigger, because it gets decremented when we send it
+		ipreply.payload = icmppkt
+		ipreply.srcip = self.net.interface_by_name(dev).ipaddr
+		match = self.FT_lookup(ipreply, dev)
+		intf = self.net.interface_by_name(match[3])
+		prefix = match[1]
+		nexthop = match[2]
+		if nexthop not in self.macaddrs:
+			self.queue.append([match, floor(time()), ipreply, 0])
+			print 'making ARP request from make_ICMP'
+			self.send_arp_request(match)
+		else:
+			self.send_packet(match, ipreply)   
+		'''
+		ether = pktlib.ethernet()
 		ether.type = ether.IP_TYPE
 		ether.src = ##
 		ether.dst = ##
 		ether.payload = ipreply
 		self.net.send_packet(#####)
-	    
-
+		'''
+		
 def srpy_main(net):
 	'''
 	Main entry point for router.  Just create Router
