@@ -69,7 +69,6 @@ class Router(object):
 				else:
 					if match[2] in [str(x[2]) for x in self.my_intfs]: #packet for us, send unreachable port error
 						if pkt.protocol == pkt.ICMP_PROTOCOL and pkt.payload.type == pktlib.TYPE_ECHO_REQUEST: #if it's a ping
-							print 'making ICMP for PING'
 							self.make_ICMP('PING', pkt, dev)
 							continue
 						else: #if destined for us, but not an echo
@@ -211,6 +210,7 @@ class Router(object):
 	def make_ICMP(self, TYPE, pkt, dev):
 		icmppkt = pktlib.icmp()  
 		if(TYPE=='PING'): #if ping type
+			print 'ping reply'
 			icmppkt.type = pktlib.TYPE_ECHO_REPLY
 			ping = pktlib.echo()
 			ping.id = pkt.payload.payload.id
@@ -219,14 +219,18 @@ class Router(object):
 			icmppkt.payload = ping
 		else: #if error message
 			if(TYPE=='TIMEEXCEED'):
+				print 'time exceed'
 				icmppkt.type = pktlib.TYPE_TIME_EXCEED
 			else:
 				icmppkt.type = pktlib.TYPE_DEST_UNREACH
 				if(TYPE=='UNREACH_NET'): #if table lookup failed
+					print 'net unreach'
 					icmppkt.code = pktlib.CODE_UNREACH_NET
 				elif(TYPE=='UNREACH_HOST'): #if sent 5 arps and no reply from host
+					print 'host unreach'
 					icmppkt.code = pktlib.CODE_UNREACH_HOST
 				elif(TYPE=='UNREACH_PORT'): #sent to us, but not an ICMP PING
+					print 'port unreach'
 					icmppkt.code = pktlib.CODE_UNREACH_PORT
 				else:
 					print 'wtf?  if it wasnt one of these errors, something REALLY went wrong'
@@ -246,7 +250,6 @@ class Router(object):
 		nexthop = match[2]
 		if nexthop not in self.macaddrs:
 			self.queue.append([match, floor(time()), ipreply, 0])
-			print 'making ARP request from make_ICMP'
 			self.send_arp_request(match)
 		else:
 			self.send_packet(match, ipreply)   
